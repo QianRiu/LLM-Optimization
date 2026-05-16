@@ -4,7 +4,7 @@ import argparse
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
-from attention_patch import enable_streaming_llm, enable_cross_layer_kv
+from backup.attention_patch import enable_streaming_llm, enable_cross_layer_kv
 
 def calculate_metrics(model, tokenizer, dataset_name, num_samples, max_seq_length, device, method):
     model.eval()
@@ -22,6 +22,29 @@ def calculate_metrics(model, tokenizer, dataset_name, num_samples, max_seq_lengt
     throughputs = []
 
     seq_len = max_seq_length
+
+    # Perform warmup before the measurement loop to properly initialize CUDA kernels and memory allocator
+    print("Performing warmup...")
+    warmup_begin = 0
+    warmup_end = seq_len
+    warmup_input_ids = encodings.input_ids[:, warmup_begin:warmup_end].to(device)
+    warmup_target_ids = warmup_input_ids.clone()
+    warmup_target_ids[:, :-1] = -100
+    warmup_prompt_ids = encodings.input_ids[:, warmup_begin:warmup_begin+seq_len//2].to(device)
+    warmup_attention_mask = torch.ones_like(warmup_prompt_ids)
+    
+    with torch.no_grad():
+        # 完全模拟一次评估流程来充分热身
+        if method == "baseline":
+            _ = model(warmup_input_ids, labels=warmup_target_ids)
+        else:
+            # Avoid creating persistent KV cache objects during warmup to prevent
+            # ghost state leakage into later eval (see README.md issue "幽灵状态泄漏").
+            _ = model(warmup_input_ids[:, 0:1], use_cache=False, position_ids=torch.tensor([[0]], device=device))
+        _ = model.generate(warmup_prompt_ids, attention_mask=warmup_attention_mask, pad_token_id=tokenizer.eos_token_id, max_new_tokens=1)
+        _ = model.generate(warmup_prompt_ids, attention_mask=warmup_attention_mask, pad_token_id=tokenizer.eos_token_id, max_new_tokens=11, min_new_tokens=11)
+    torch.cuda.synchronize()
+
     for i in range(min(num_samples, encodings.input_ids.size(1) // seq_len)):
         begin_loc = i * seq_len
         end_loc = begin_loc + seq_len
@@ -32,6 +55,7 @@ def calculate_metrics(model, tokenizer, dataset_name, num_samples, max_seq_lengt
         target_ids[:, :-1] = -100
 
         with torch.no_grad():
+            torch.cuda.nvtx.range_push("PPL_Calculation")
             if method == "baseline":
                 outputs = model(input_ids, labels=target_ids)
                 # target_ids has -100 at the last position, but model.loss computes average over valid tokens
@@ -61,24 +85,31 @@ def calculate_metrics(model, tokenizer, dataset_name, num_samples, max_seq_lengt
                     curr_input = input_ids[:, step+1:step+2]
                 
                 nlls.append(torch.tensor(nll_sum))
+            torch.cuda.nvtx.range_pop()
 
         # TTFT and TPOT measurement
         prompt_ids = encodings.input_ids[:, begin_loc:begin_loc+seq_len//2].to(device)
         attention_mask = torch.ones_like(prompt_ids)
-        model.generate(prompt_ids, attention_mask=attention_mask, pad_token_id=tokenizer.eos_token_id, max_new_tokens=1)
+
+        # 确保前面的 PPL 计算（异步 CUDA kernel）全部执行完成
+        # 否则 PPL kernel 的执行时间会叠加并泄漏到即将进行的 TTFT 测试时间中
         torch.cuda.synchronize()
 
+        torch.cuda.nvtx.range_push("TTFT_Measurement")
         start_time = time.time()
         _ = model.generate(prompt_ids, attention_mask=attention_mask, pad_token_id=tokenizer.eos_token_id, max_new_tokens=1)
         torch.cuda.synchronize()
         ttft = time.time() - start_time
         ttfts.append(ttft)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("TPOT_Measurement")
         start_time = time.time()
         # Ensure we generate exactly 10 tokens for TPOT calculation
         out_ids = model.generate(prompt_ids, attention_mask=attention_mask, pad_token_id=tokenizer.eos_token_id, max_new_tokens=11, min_new_tokens=11)
         torch.cuda.synchronize()
         total_time = time.time() - start_time
+        torch.cuda.nvtx.range_pop()
         
         # Total time -= TTFT, divide by tokens generated (10)
         tpot = (total_time - ttft) / 10.0
@@ -96,6 +127,13 @@ def calculate_metrics(model, tokenizer, dataset_name, num_samples, max_seq_lengt
     print(f"Average TPOT: {np.mean(tpots)*1000:.2f} ms")
     print(f"Average Throughput: {np.mean(throughputs):.2f} tokens/s")
     # Note: FLOPs estimation typically requires deepspeed or similar tools, excluded for simplicity in this baseline
+
+    # Ensure any cross-layer KV temporary state from warmup is cleared before exiting
+    if hasattr(model, "_cross_layer_kv_state"):
+        try:
+            model._cross_layer_kv_state.clear()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
