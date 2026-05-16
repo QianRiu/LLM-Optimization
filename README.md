@@ -105,8 +105,9 @@
 ---
 
 **文件结构**  
-    .
-    ├── attention_patch.py   # StreamingLLM, Cross-Layer KV 等补丁
-    ├── baseline.py          # 主评测脚本
-    ├── result.md            # 原始实验记录
-    └── README.md
+```text
+.
+├── attention_patch.py   # StreamingLLM, Cross-Layer KV 等补丁
+├── baseline.py          # 主评测脚本
+├── result.md            # 原始实验记录
+└── README.md
